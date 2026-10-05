@@ -11,7 +11,7 @@ from .schemas import ConteudoQuestao, Revisao
 from .tools import FERRAMENTAS
 
 MAX_ITERACOES = 5
-MAX_REVISOES = 2  # NOVO: quantas vezes o gerador pode refazer
+MAX_REVISOES = 1  # NOVO: quantas vezes o gerador pode refazer
 
 SYSTEM = ("Você elabora questões de múltipla escolha. Use buscar_material para encontrar "
           "o conteúdo antes de escrever. Toda afirmação deve vir dos trechos. Quando tiver "
@@ -66,7 +66,9 @@ def estruturar(estado: Estado) -> dict:
     if resultado["parsed"] is None:
         erro = resultado["parsing_error"] or f"sem saída estruturada: {str(resultado['raw'].content)[:200]}"
         return {"mensagens": novas, "questao": None, "erro": str(erro)}
-    return {"mensagens": novas, "questao": resultado["parsed"].model_dump(), "erro": None}
+    q = resultado["parsed"].model_dump()
+    q["fontes"] = [retriever.resolver_fonte(f) for f in q["fontes"]]
+    return {"mensagens": novas, "questao": q, "erro": None}
 
 
 # NOVO ------------------------------------------------------------
@@ -85,7 +87,7 @@ def checagens_deterministicas(q: dict) -> list[str]:
 def revisor(estado: Estado) -> dict:
     tentativas = estado.get("tentativas", 0) + 1
     q = estado.get("questao")
-    if q is None:  # a saída nem passou no schema: o erro de validação vira o feedback
+    if q is None: 
         return {"tentativas": tentativas,
                 "revisao": {"aprovada": False, "nota": 0, "problemas": [f"Saída inválida: {estado['erro']}"],
                             "sugestoes": "Respeite o formato pedido."}}
@@ -108,12 +110,13 @@ def revisor(estado: Estado) -> dict:
                 "revisao": {"aprovada": False, "nota": 0,
                             "problemas": problemas_codigo + [f"REVISOR FALHOU: {motivo}"], "sugestoes": ""}}
 
-    # O CÓDIGO agrega o julgamento por alternativa
     verdadeiras = sorted(a.indice for a in rev.analise_alternativas if a.verdadeira)
+    divergencia = False
     if len(verdadeiras) != 1:
         problemas_codigo.append(f"O revisor considerou {len(verdadeiras)} alternativas corretas "
                                 f"({verdadeiras}); deve haver exatamente uma.")
     elif verdadeiras[0] != q["indice_correta"]:
+        divergencia = True
         problemas_codigo.append(f"O gabarito marca a {q['indice_correta']}, mas o revisor resolveu "
                                 f"como {verdadeiras[0]}.")
 
@@ -128,7 +131,9 @@ def revisor(estado: Estado) -> dict:
 
     aprovada = (not problemas_codigo and rev.distratores_plausiveis and rev.aderente_ao_pedido
                 and rev.clareza and rev.nota >= 7)
+    
     revisao = rev.model_dump() | {"aprovada": aprovada, "verdadeiras": verdadeiras,
+                                  "divergencia": divergencia, "problemas_codigo": list(problemas_codigo),
                                   "problemas": problemas_codigo + rev.problemas}
 
     return {"revisao": revisao, "tentativas": tentativas}

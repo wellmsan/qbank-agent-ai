@@ -27,5 +27,12 @@ class Retriever:
         ordem = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
         return [(self.ids[i], self.trechos[self.ids[i]]) for i in ordem if scores[i] > 0]
 
+    def resolver_fonte(self, fid: str) -> str:
+        """Corrige IDs truncados quando há UMA interpretação possível; senão, devolve como veio."""
+        if fid in self.trechos:
+            return fid
+        sufixo = fid.split("#")[-1]
+        candidatos = [t for t in self.trechos if t.split("#")[-1] == sufixo and t.endswith(fid)]
+        return candidatos[0] if len(candidatos) == 1 else fid
 
 retriever = Retriever()

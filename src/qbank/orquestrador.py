@@ -5,11 +5,17 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from .agent import agente
+from .agente import agente
 from .config import settings
 from .llm import estruturado
 from .retrieval import normalizar, retriever
 from .schemas import Plano
+
+import sqlite3
+from langchain_core.runnables import RunnableConfig
+from langgraph.types import Send, interrupt
+from .banco import DATA, banco
+
 
 SYSTEM_ORQUESTRADOR = """Você é o coordenador pedagógico de um banco de questões.
 Transforme o pedido em um plano com uma especificação por questão.
@@ -43,6 +49,10 @@ class EstadoLote(TypedDict, total=False):
     resultados: Annotated[list[dict], operator.add]
     aprovadas: list[dict]
     alertas: Annotated[list[str], operator.add]
+    candidatas: list[dict]
+    reprovadas: list[dict]
+    decisoes: list[str]
+    salvas: list[int]
 
 
 # ---------------- nós ----------------
@@ -82,36 +92,74 @@ def produzir_questao(payload: dict) -> dict:
     return {"resultados": [{
         "indice": payload["indice"], "espec": e, "questao": final.get("questao"),
         "aprovada": bool(rev.get("aprovada")), "tentativas": final.get("tentativas", 0),
-        "problemas": rev.get("problemas", []),
+        "problemas": rev.get("problemas", []), "revisao": rev,
     }]}
 
 
 def consolidar(estado: EstadoLote) -> dict:
-    """Reduce: ordena, descarta reprovadas e remove duplicatas DENTRO do lote."""
-    aprovadas, alertas = [], []
+    candidatas, reprovadas, alertas = [], [], []
     for r in sorted(estado.get("resultados", []), key=lambda r: r["indice"]):
         rotulo = f"Questão {r['indice'] + 1} ({r['espec']['subtopico']})"
-        if not r["aprovada"]:
+        q, rev = r["questao"], r["revisao"]
+        # Divergência de gabarito como ÚNICO problema objetivo: um humano arbitra
+        divergente = (not r["aprovada"] and q is not None and rev.get("divergencia")
+                      and len(rev.get("problemas_codigo", [])) == 1)
+        if not r["aprovada"] and not divergente:
             alertas.append(f"{rotulo} reprovada após {r['tentativas']} tentativa(s): {r['problemas'][:1]}")
+            reprovadas.append(r)
+            if settings.humano_revisa_reprovadas and q is not None:
+                candidatas.append(q | {"topico": estado["topico"], "dificuldade": r["espec"]["dificuldade"],
+                                       "status": "reprovada", "gabarito_revisor": None,
+                                       "problemas": r["problemas"]})
             continue
-        q = r["questao"]
-        if any(similaridade(q["enunciado"], a["enunciado"]) > 0.6 for a in aprovadas):
+        if any(similaridade(q["enunciado"], c["enunciado"]) > 0.6 for c in candidatas):
             alertas.append(f"{rotulo} descartada: muito parecida com outra do lote.")
             continue
-        aprovadas.append(q | {"topico": estado["topico"], "dificuldade": r["espec"]["dificuldade"]})
-    return {"aprovadas": aprovadas, "alertas": alertas}
+        candidatas.append(q | {"topico": estado["topico"], "dificuldade": r["espec"]["dificuldade"],
+                               "status": "divergente" if divergente else "aprovada",
+                               "gabarito_revisor": rev["verdadeiras"][0] if divergente else None})
+    return {"candidatas": candidatas, "reprovadas": reprovadas, "alertas": alertas}
 
 
-def construir():
+def construir(checkpointer=None):
     g = StateGraph(EstadoLote)
     g.add_node("planejar", planejar)
     g.add_node("produzir_questao", produzir_questao)
     g.add_node("consolidar", consolidar)
+    g.add_node("aprovacao_humana", aprovacao_humana)
+    g.add_node("persistir", persistir)
     g.add_edge(START, "planejar")
     g.add_conditional_edges("planejar", distribuir, ["produzir_questao", END])
-    g.add_edge("produzir_questao", "consolidar")   # o consolidar espera TODOS os Sends terminarem
-    g.add_edge("consolidar", END)
-    return g.compile()
+    g.add_edge("produzir_questao", "consolidar")
+    g.add_conditional_edges("consolidar", lambda s: "aprovacao_humana" if s.get("candidatas") else END,
+                            ["aprovacao_humana", END])
+    g.add_edge("aprovacao_humana", "persistir")
+    g.add_edge("persistir", END)
+    return g.compile(checkpointer=checkpointer)
 
+
+def aprovacao_humana(estado: EstadoLote) -> dict:
+    # ATENÇÃO: na retomada, este nó roda DE NOVO desde o início, e interrupt() devolve a resposta.
+    # Por isso, nada com efeito colateral pode vir antes do interrupt().
+    decisoes = interrupt({"candidatas": estado["candidatas"], "alertas": estado.get("alertas", [])})
+    return {"decisoes": decisoes}
+
+
+def persistir(estado: EstadoLote, config: RunnableConfig) -> dict:
+    """A ÚNICA escrita no banco do sistema inteiro, e só depois da decisão humana."""
+    thread_id = config["configurable"]["thread_id"]
+    ids = []
+    for q, decisao in zip(estado["candidatas"], estado["decisoes"]):
+        if decisao == "c" and q.get("gabarito_revisor") is not None:
+            q = q | {"indice_correta": q["gabarito_revisor"]}
+        if decisao in ("a", "c"):
+            ids.append(banco.salvar(q, thread_id))
+    return {"salvas": ids}
+
+
+def checkpointer_sqlite():
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    DATA.mkdir(parents=True, exist_ok=True)
+    return SqliteSaver(sqlite3.connect(DATA / "checkpoints.sqlite", check_same_thread=False))
 
 orquestrador = construir()

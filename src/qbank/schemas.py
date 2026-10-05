@@ -72,4 +72,5 @@ class Plano(BaseModel):
     topico: str = Field(description="Tópico geral do lote, ex.: 'Java Streams'")
     especificacoes: list[EspecQuestao] = Field(
         description="Exatamente 'quantidade_pedida' itens, menos os que o material não cobre; cada um com subtópico DIFERENTE")
-    observacoes: str = Field(default="", description="Partes do pedido que o material não cobre")
+    observacoes: str = Field(default="", description="SOMENTE partes do pedido que o material NÃO cobre. "
+                                                    "Deixe vazio se o material cobre tudo.")
